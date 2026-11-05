@@ -11,15 +11,25 @@ one UI.
 
 ## Build status — honest
 
-**Day 2 of 15 (flagship build sequence).** Done: repo scaffold, CI, the full
+**Day 4 of 15 (flagship build sequence).** Done: repo scaffold, CI, the full
 data model, the LLM gateway, and the intake endpoint (URL → cited ICP draft).
 Day 2 added: richer extraction (Open Graph, Twitter meta, JSON-LD, link
 anchors — deduped), an honest `extraction_quality: "thin"` flag for
 JS-rendered pages that expose little readable text, persistence behind a
 Store interface (local JSON store today — every intake is saved and listed
 on the landing page), and workspace-scoped RLS policies in
-`db/policies.sql` (written, not applied — no Supabase project yet). Not yet
-built: topic engine port (Days 3–5), carousel renderer + approval queue UI
+`db/policies.sql` (written, not applied — no Supabase project yet).
+Day 3 added the topic engine (`lib/topics.ts`): candidates generated
+through the LLM gateway (deterministic baseline with no keys), deduped
+against the profile's stored topics — the anti-repetition memory — scored
+on utility + novelty behind `POST /api/topics:score`, and persisted as
+candidates. Day 4 added the fact-check + quality gate (`lib/quality.ts`):
+pack drafts are verdicted claim by claim against the profile's verified
+facts, scored 0–100, and a pack with a contradicted claim or a score
+below 70 cannot be approved — decided in one function, exposed at
+`POST /api/packs:gate`, and proven by a golden-pack eval (a clean pack
+passes; a pack with planted false claims is blocked). Not yet built:
+content-pack generation + carousel renderer + approval queue UI
 (Days 6–8), Meta scheduling (Days 9–10), reel renderer (Days 11–12), lead
 ledger (Day 13). Nothing here is deployed yet.
 
@@ -101,7 +111,8 @@ implementation can replace it without touching the routes.
 | Route | Status | Purpose |
 |---|---|---|
 | `POST /api/intake` | ✅ Day 1, persistence Day 2 | Fetch a product URL, return facts + cited ICP draft; saves the profile and returns `profile_id` |
-| `POST /api/topics:score` | Days 3–5 | Score and dedupe topics against memory |
+| `POST /api/topics:score` | ✅ Day 3 | Generate (or accept) topic candidates, dedupe against the profile's stored topics, score utility + novelty, persist candidates |
+| `POST /api/packs:gate` | ✅ Day 4 | Fact-check a pack draft against the profile's verified facts; returns quality score, per-claim verdicts and whether approval is allowed |
 | `POST /api/packs` | Days 6–8 | Generate a content pack |
 | `POST /api/packs/:id/approve` | Days 6–8 | The only route that can schedule |
 | `POST /api/publish/run` | Days 9–10 | Worker-only; checks approval, publishes, writes the result |
