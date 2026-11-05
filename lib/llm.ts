@@ -19,9 +19,16 @@ import {
   type Fact,
   type IcpDraft,
 } from "./intake";
+import {
+  buildTopicCandidates,
+  TOPICS_PROMPT_VERSION,
+  type TopicCandidate,
+  type TopicSourceProfile,
+} from "./topics";
 
 export const BASELINE_PROVIDER = "deterministic-baseline";
 const LLM_PROMPT_VERSION = "icp-llm-v1";
+const TOPICS_LLM_PROMPT_VERSION = "topics-llm-v1";
 const LLM_TIMEOUT_MS = 20_000;
 
 export interface IcpGenerationResult {
@@ -29,10 +36,16 @@ export interface IcpGenerationResult {
   provider: string;
 }
 
+export interface TopicGenerationResult {
+  candidates: TopicCandidate[];
+  provider: string;
+}
+
 export interface LlmProvider {
   readonly name: string;
   isConfigured(): boolean;
   draftIcp(facts: Fact[]): Promise<IcpDraft>;
+  draftTopics(profile: TopicSourceProfile, count: number): Promise<TopicCandidate[]>;
 }
 
 /* ------------------------- baseline provider ------------------------ */
@@ -44,6 +57,9 @@ export class DeterministicBaselineProvider implements LlmProvider {
   }
   async draftIcp(facts: Fact[]): Promise<IcpDraft> {
     return buildIcpDraft(facts);
+  }
+  async draftTopics(profile: TopicSourceProfile, count: number): Promise<TopicCandidate[]> {
+    return buildTopicCandidates(profile, count);
   }
 }
 
@@ -76,6 +92,45 @@ function coerceDraft(parsed: unknown, facts: Fact[]): IcpDraft {
     throw new Error("Provider returned no cited audiences.");
   }
   return enforced;
+}
+
+function buildTopicsPrompt(profile: TopicSourceProfile, count: number): string {
+  const factList = profile.facts.map((f) => `[${f.id}] (${f.kind}) ${f.text}`).join("\n");
+  const audiences = profile.icp_draft.audiences
+    .map((a) => `- ${a.name}: ${a.pains.map((p) => p.text).join(" ")}`)
+    .join("\n");
+  return [
+    "You are the topic engine for a go-to-market content tool.",
+    `From the product facts and ICP audiences below, propose exactly ${count} content topics.`,
+    'Produce a JSON object with exactly this shape: {"topics": [{"title": string, "angle": string}]}',
+    "Rules: every topic must serve one of the named audiences and stay grounded in the listed facts.",
+    "Do not repeat a subject twice. Do not invent product capabilities. Return JSON only.",
+    "",
+    "Product facts:",
+    factList,
+    "",
+    "ICP audiences and pains:",
+    audiences,
+  ].join("\n");
+}
+
+function coerceTopics(parsed: unknown, count: number): TopicCandidate[] {
+  const obj = (parsed ?? {}) as { topics?: unknown };
+  const list = Array.isArray(obj.topics) ? obj.topics : [];
+  const candidates: TopicCandidate[] = [];
+  for (const item of list) {
+    const t = (item ?? {}) as Partial<TopicCandidate>;
+    if (typeof t.title !== "string" || !t.title.trim()) continue;
+    candidates.push({
+      title: t.title.trim(),
+      angle: typeof t.angle === "string" ? t.angle.trim() : "",
+    });
+    if (candidates.length >= count) break;
+  }
+  if (candidates.length === 0) {
+    throw new Error("Provider returned no usable topics.");
+  }
+  return candidates;
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
@@ -115,6 +170,24 @@ export class GroqProvider implements LlmProvider {
     if (!content) throw new Error("Groq returned no content.");
     return coerceDraft(JSON.parse(content), facts);
   }
+  async draftTopics(profile: TopicSourceProfile, count: number): Promise<TopicCandidate[]> {
+    const data = (await fetchJson("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY ?? ""}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [{ role: "user", content: buildTopicsPrompt(profile, count) }],
+      }),
+    })) as { choices?: Array<{ message?: { content?: string } }> };
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error("Groq returned no content.");
+    return coerceTopics(JSON.parse(content), count);
+  }
 }
 
 /* ---------------------------- Gemini -------------------------------- */
@@ -140,6 +213,23 @@ export class GeminiProvider implements LlmProvider {
     const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!content) throw new Error("Gemini returned no content.");
     return coerceDraft(JSON.parse(content), facts);
+  }
+  async draftTopics(profile: TopicSourceProfile, count: number): Promise<TopicCandidate[]> {
+    const key = process.env.GEMINI_API_KEY ?? "";
+    const data = (await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: buildTopicsPrompt(profile, count) }] }],
+          generationConfig: { temperature: 0, responseMimeType: "application/json" },
+        }),
+      },
+    )) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!content) throw new Error("Gemini returned no content.");
+    return coerceTopics(JSON.parse(content), count);
   }
 }
 
@@ -174,4 +264,27 @@ export async function generateIcp(facts: Fact[]): Promise<IcpGenerationResult> {
   }
 }
 
-export { ICP_PROMPT_VERSION };
+/**
+ * Generate topic candidates through the gateway — same contract as
+ * generateIcp: the configured provider is tried first, any failure falls
+ * back to the deterministic baseline, and the returned provider name is
+ * always the one that actually produced the candidates. Candidates are
+ * NOT scored here; dedupe + scoring live in lib/topics.ts.
+ */
+export async function generateTopics(
+  profile: TopicSourceProfile,
+  count: number,
+): Promise<TopicGenerationResult> {
+  const provider = selectProvider();
+  if (provider.name === BASELINE_PROVIDER) {
+    return { candidates: await provider.draftTopics(profile, count), provider: provider.name };
+  }
+  try {
+    return { candidates: await provider.draftTopics(profile, count), provider: provider.name };
+  } catch {
+    const baseline = new DeterministicBaselineProvider();
+    return { candidates: await baseline.draftTopics(profile, count), provider: baseline.name };
+  }
+}
+
+export { ICP_PROMPT_VERSION, TOPICS_PROMPT_VERSION, TOPICS_LLM_PROMPT_VERSION };
