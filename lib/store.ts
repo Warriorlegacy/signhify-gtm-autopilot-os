@@ -79,6 +79,35 @@ export interface StoredPipelineRun {
   recorded_at: string;
 }
 
+/** A scored topic candidate ready to persist (schema: topics row minus ids). */
+export interface TopicToStore {
+  title: string;
+  angle: string | null;
+  score_utility: number;
+  score_novelty: number;
+  score_total: number;
+  /** The scoring context that produced this topic (schema: source_packet). */
+  source_packet: unknown;
+  prompt_version: string;
+  provider: string;
+}
+
+export interface StoredTopic {
+  id: string;
+  workspace_slug: string;
+  product_profile_id: string | null;
+  title: string;
+  angle: string | null;
+  score_utility: number;
+  score_novelty: number;
+  score_total: number;
+  status: "candidate";
+  source_packet: unknown;
+  prompt_version: string;
+  provider: string;
+  stored_at: string;
+}
+
 /* ---------------------------- interface ----------------------------- */
 
 export interface Store {
@@ -88,6 +117,13 @@ export interface Store {
   ): Promise<StoredProductProfile>;
   logPipelineRun(run: PipelineRunInput): Promise<StoredPipelineRun>;
   listProductProfiles(limit: number): Promise<StoredProductProfile[]>;
+  getProductProfile(id: string): Promise<StoredProductProfile | null>;
+  saveTopics(
+    workspaceSlug: string,
+    profileId: string | null,
+    topics: TopicToStore[],
+  ): Promise<StoredTopic[]>;
+  listTopicsForProfile(profileId: string): Promise<StoredTopic[]>;
 }
 
 /* ---------------------------- LocalStore ---------------------------- */
@@ -96,9 +132,33 @@ interface StoreFile {
   version: 1;
   product_profiles: StoredProductProfile[];
   pipeline_runs: StoredPipelineRun[];
+  topics: StoredTopic[];
 }
 
-const EMPTY_STORE: StoreFile = { version: 1, product_profiles: [], pipeline_runs: [] };
+const EMPTY_STORE: StoreFile = {
+  version: 1,
+  product_profiles: [],
+  pipeline_runs: [],
+  topics: [],
+};
+
+/**
+ * Newest first, deterministically. stored_at has millisecond precision, so
+ * two records written in the same millisecond tie on the timestamp alone —
+ * and a plain stable sort then leaks append order (oldest first) through,
+ * which made "lists newest first" fail intermittently in CI. The store file
+ * is append-only, so array position IS insertion order and survives reload:
+ * break timestamp ties by later insertion winning.
+ */
+function newestFirst<T extends { stored_at: string }>(items: T[]): T[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort(
+      (a, b) =>
+        b.item.stored_at.localeCompare(a.item.stored_at) || b.index - a.index,
+    )
+    .map(({ item }) => item);
+}
 
 export class LocalStore implements Store {
   private readonly filePath: string;
@@ -126,6 +186,8 @@ export class LocalStore implements Store {
           ? parsed.product_profiles
           : [],
         pipeline_runs: Array.isArray(parsed.pipeline_runs) ? parsed.pipeline_runs : [],
+        // Store files written before Day 3 have no topics array yet.
+        topics: Array.isArray(parsed.topics) ? parsed.topics : [],
       };
     } catch {
       // A corrupt store file must not take intake down with it: move it
@@ -205,9 +267,48 @@ export class LocalStore implements Store {
 
   async listProductProfiles(limit: number): Promise<StoredProductProfile[]> {
     const data = await this.readAll();
-    return [...data.product_profiles]
-      .sort((a, b) => b.stored_at.localeCompare(a.stored_at))
-      .slice(0, Math.max(0, limit));
+    return newestFirst(data.product_profiles).slice(0, Math.max(0, limit));
+  }
+
+  async getProductProfile(id: string): Promise<StoredProductProfile | null> {
+    const data = await this.readAll();
+    return data.product_profiles.find((p) => p.id === id) ?? null;
+  }
+
+  async saveTopics(
+    workspaceSlug: string,
+    profileId: string | null,
+    topics: TopicToStore[],
+  ): Promise<StoredTopic[]> {
+    const storedAt = new Date().toISOString();
+    const records: StoredTopic[] = topics.map((topic) => ({
+      id: randomUUID(),
+      workspace_slug: workspaceSlug,
+      product_profile_id: profileId,
+      title: topic.title,
+      angle: topic.angle,
+      score_utility: topic.score_utility,
+      score_novelty: topic.score_novelty,
+      score_total: topic.score_total,
+      status: "candidate",
+      source_packet: topic.source_packet,
+      prompt_version: topic.prompt_version,
+      provider: topic.provider,
+      stored_at: storedAt,
+    }));
+    if (records.length > 0) {
+      await this.mutate(async (data) => {
+        data.topics.push(...records);
+      });
+    }
+    return records;
+  }
+
+  async listTopicsForProfile(profileId: string): Promise<StoredTopic[]> {
+    const data = await this.readAll();
+    return newestFirst(
+      data.topics.filter((t) => t.product_profile_id === profileId),
+    );
   }
 }
 
