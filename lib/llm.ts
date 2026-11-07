@@ -6,10 +6,21 @@
  *  - Gemini  (free tier) — active only when GEMINI_API_KEY is set
  *  - Deterministic baseline — always available, no key, no network.
  *
+ * Fallback chain (Day 5): Groq → Gemini → deterministic baseline. Every
+ * configured real provider is tried in order; a failure (network, HTTP
+ * error, unusable output) moves to the next provider, and the baseline
+ * is the always-available floor.
+ *
+ * Guardrail (Day 5): real-model calls are counted per UTC day. Once the
+ * count reaches LLM_DAILY_CAP (default DEFAULT_LLM_DAILY_CAP), no more
+ * real calls are made that day — the gateway serves the baseline and
+ * labels it as such. Free tiers stay free only if a runaway loop cannot
+ * burn them; the cap makes the worst case a labelled baseline, never a
+ * surprise bill or a dead key. LLM_DAILY_CAP=0 disables real calls.
+ *
  * Every result is labelled with the provider that actually produced it
  * (the honesty pattern from the TRD). Whatever the provider, the draft
- * passes through enforceCitations before it is returned, and any provider
- * failure falls back to the deterministic baseline.
+ * passes through enforceCitations before it is returned.
  */
 
 import {
@@ -233,6 +244,74 @@ export class GeminiProvider implements LlmProvider {
   }
 }
 
+/* --------------------- daily usage guardrail ---------------------- */
+
+/** Default ceiling on real-model calls per UTC day (env: LLM_DAILY_CAP). */
+export const DEFAULT_LLM_DAILY_CAP = 500;
+
+export interface LlmUsage {
+  /** UTC day the counter belongs to, YYYY-MM-DD. */
+  day: string;
+  /** Real-model calls attempted today (successful or not). */
+  real_calls: number;
+  /** The cap currently in force. */
+  cap: number;
+  /** Real calls still allowed today (never negative). */
+  remaining: number;
+}
+
+function utcToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Parse LLM_DAILY_CAP; unset/invalid/negative falls back to the default. */
+export function llmDailyCap(): number {
+  const raw = process.env.LLM_DAILY_CAP;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_LLM_DAILY_CAP;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_LLM_DAILY_CAP;
+  return Math.floor(parsed);
+}
+
+const usageState: { day: string; realCalls: number } = { day: utcToday(), realCalls: 0 };
+
+function rollUsageDay(): void {
+  const today = utcToday();
+  if (usageState.day !== today) {
+    usageState.day = today;
+    usageState.realCalls = 0;
+  }
+}
+
+/** Today's real-model usage against the cap (read-only snapshot). */
+export function llmUsageToday(): LlmUsage {
+  rollUsageDay();
+  const cap = llmDailyCap();
+  return {
+    day: usageState.day,
+    real_calls: usageState.realCalls,
+    cap,
+    remaining: Math.max(0, cap - usageState.realCalls),
+  };
+}
+
+/** Reset the counter — for tests and worker restarts only. */
+export function resetLlmUsage(): void {
+  usageState.day = utcToday();
+  usageState.realCalls = 0;
+}
+
+/**
+ * Consume one real-call slot. Returns false when today's cap is already
+ * reached: the caller must not make the real call and falls back instead.
+ */
+function tryConsumeRealCall(): boolean {
+  rollUsageDay();
+  if (usageState.realCalls >= llmDailyCap()) return false;
+  usageState.realCalls += 1;
+  return true;
+}
+
 /* --------------------------- the gateway ---------------------------- */
 
 const PROVIDERS: LlmProvider[] = [
@@ -247,44 +326,49 @@ export function selectProvider(): LlmProvider {
 }
 
 /**
- * Generate an ICP draft through the gateway. Real providers are tried first
- * when configured; any failure falls back to the deterministic baseline.
- * The returned provider name is always the one that actually produced it.
+ * Run one gateway operation through the fallback chain: each configured
+ * real provider in order (Groq, then Gemini), subject to the daily cap,
+ * then the deterministic baseline. The returned provider name is always
+ * the one that actually produced the value.
  */
-export async function generateIcp(facts: Fact[]): Promise<IcpGenerationResult> {
-  const provider = selectProvider();
-  if (provider.name === BASELINE_PROVIDER) {
-    return { draft: await provider.draftIcp(facts), provider: provider.name };
+async function runWithFallback<T>(
+  call: (provider: LlmProvider) => Promise<T>,
+): Promise<{ value: T; provider: string }> {
+  for (const provider of PROVIDERS) {
+    if (provider.name === BASELINE_PROVIDER) break;
+    if (!provider.isConfigured()) continue;
+    if (!tryConsumeRealCall()) break; // cap reached — straight to baseline
+    try {
+      return { value: await call(provider), provider: provider.name };
+    } catch {
+      // fall through to the next provider in the chain
+    }
   }
-  try {
-    return { draft: await provider.draftIcp(facts), provider: provider.name };
-  } catch {
-    const baseline = new DeterministicBaselineProvider();
-    return { draft: await baseline.draftIcp(facts), provider: baseline.name };
-  }
+  const baseline = new DeterministicBaselineProvider();
+  return { value: await call(baseline), provider: baseline.name };
 }
 
 /**
- * Generate topic candidates through the gateway — same contract as
- * generateIcp: the configured provider is tried first, any failure falls
- * back to the deterministic baseline, and the returned provider name is
- * always the one that actually produced the candidates. Candidates are
- * NOT scored here; dedupe + scoring live in lib/topics.ts.
+ * Generate an ICP draft through the gateway: Groq → Gemini → baseline,
+ * with the daily guardrail applied to every real call. The returned
+ * provider name is always the one that actually produced the draft.
+ */
+export async function generateIcp(facts: Fact[]): Promise<IcpGenerationResult> {
+  const { value, provider } = await runWithFallback((p) => p.draftIcp(facts));
+  return { draft: value, provider };
+}
+
+/**
+ * Generate topic candidates through the gateway — same chain and
+ * guardrail as generateIcp. Candidates are NOT scored here; dedupe +
+ * scoring live in lib/topics.ts.
  */
 export async function generateTopics(
   profile: TopicSourceProfile,
   count: number,
 ): Promise<TopicGenerationResult> {
-  const provider = selectProvider();
-  if (provider.name === BASELINE_PROVIDER) {
-    return { candidates: await provider.draftTopics(profile, count), provider: provider.name };
-  }
-  try {
-    return { candidates: await provider.draftTopics(profile, count), provider: provider.name };
-  } catch {
-    const baseline = new DeterministicBaselineProvider();
-    return { candidates: await baseline.draftTopics(profile, count), provider: baseline.name };
-  }
+  const { value, provider } = await runWithFallback((p) => p.draftTopics(profile, count));
+  return { candidates: value, provider };
 }
 
 export { ICP_PROMPT_VERSION, TOPICS_PROMPT_VERSION, TOPICS_LLM_PROMPT_VERSION };

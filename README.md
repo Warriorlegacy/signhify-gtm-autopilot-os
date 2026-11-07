@@ -11,7 +11,7 @@ one UI.
 
 ## Build status — honest
 
-**Day 4 of 15 (flagship build sequence).** Done: repo scaffold, CI, the full
+**Day 5 of 15 (flagship build sequence).** Done: repo scaffold, CI, the full
 data model, the LLM gateway, and the intake endpoint (URL → cited ICP draft).
 Day 2 added: richer extraction (Open Graph, Twitter meta, JSON-LD, link
 anchors — deduped), an honest `extraction_quality: "thin"` flag for
@@ -28,10 +28,22 @@ pack drafts are verdicted claim by claim against the profile's verified
 facts, scored 0–100, and a pack with a contradicted claim or a score
 below 70 cannot be approved — decided in one function, exposed at
 `POST /api/packs:gate`, and proven by a golden-pack eval (a clean pack
-passes; a pack with planted false claims is blocked). Not yet built:
-content-pack generation + carousel renderer + approval queue UI
-(Days 6–8), Meta scheduling (Days 9–10), reel renderer (Days 11–12), lead
-ledger (Day 13). Nothing here is deployed yet.
+passes; a pack with planted false claims is blocked). Day 5 completed
+the Autogram port — the gateway's real LLM adapters are now the full
+fallback chain (Groq → Gemini → deterministic baseline, plain `fetch`,
+no vendor SDKs): a provider failure moves to the next provider instead
+of straight to baseline, every response still names the provider that
+actually produced it, and a per-day guardrail (`LLM_DAILY_CAP`, default
+500) stops real-model calls once the day's budget is spent and serves
+the labelled baseline instead. The adapters are unit-tested with a
+mocked `fetch` — no keys needed. The golden-pack eval is now a harness
+of its own (`tests/eval.test.ts`, `npm run eval`): four golden packs —
+clean, planted-contradiction, low-quality (score 55, blocked) and
+borderline (score exactly 70, passes) — run through both the topic
+scoring and quality-gate stages, and CI runs the eval on every push.
+Not yet built: content-pack generation + carousel renderer + approval
+queue UI (Days 6–8), Meta scheduling (Days 9–10), reel renderer
+(Days 11–12), lead ledger (Day 13).
 
 ## The 60-second demo
 
@@ -66,8 +78,13 @@ provider that actually produced the output.
 Verify the build:
 
 ```bash
-npm run typecheck && npm test && npm run build
+npm run typecheck && npm test && npm run eval && npm run build
 ```
+
+`npm run eval` is the golden-pack harness: four fixture packs with known
+verdicts run through topic scoring + the quality gate, and any drift
+between the pipeline's decision and the recorded verdict fails the run.
+CI runs it on every push.
 
 ## Architecture
 
