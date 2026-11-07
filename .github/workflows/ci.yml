@@ -16,4 +16,6 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Golden-pack eval (topic scoring + quality gate)
+        run: npm run eval
       - run: npm run build
